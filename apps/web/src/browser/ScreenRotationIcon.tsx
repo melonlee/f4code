@@ -13,7 +13,7 @@ export function ScreenRotationIcon() {
       <path d="M12.5 2a10 10 0 0 1 8.4 5.4" />
       <path d="M20.8 3.5v4h-4" />
       <path d="M11.5 22a10 10 0 0 1-8.4-5.4" />
-      <path d="F4.2 20.5v-4h4" />
+      <path d="M3.2 20.5v-4h4" />
     </svg>
   );
 }
