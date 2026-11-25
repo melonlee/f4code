@@ -30,6 +30,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  type RuntimeMode,
   ThreadId,
   TurnItemId,
   type ServerProviderModel,
@@ -2109,9 +2110,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   it.effect.each([
     { name: "dangerous command", networkApprovalContext: undefined, asks: false },
     {
-      name: "managed-network command",
+      // Full access means the user already granted network use; an ask here strands the browser
+      // tools (Playwright and friends) behind a prompt nobody expected to see.
+      name: "command that needs the network",
       networkApprovalContext: { host: "example.com", protocol: "https" },
-      asks: true,
+      asks: false,
     },
   ] as const)("full access asks about a $name: $asks", ({ networkApprovalContext, asks }) =>
     Effect.gen(function* () {
@@ -2988,7 +2991,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         "mcp_servers.extra.command": "cat",
       };
       for (const recordedMcp of [
-        { mcp_servers: { "f4code": recordedServer } },
+        { mcp_servers: { f4code: recordedServer } },
         { "mcp_servers.f4code": recordedServer, "mcp_servers.extra.command": "echo" },
       ]) {
         const entries = codexReplayPreamble({
@@ -13536,31 +13539,55 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       },
     });
 
+    // These cases are about how an approval is *presented*, so they run one step below Full
+    // access; Full access answers approvals itself and surfaces nothing to present.
+    const ASKS = "approval-required" as const;
+    // turn/start carries the mode's approval and sandbox policies; the replay only normalizes
+    // Full access away, so any other mode has to state them here.
+    const turnPolicyFor = (runtimeMode: RuntimeMode) =>
+      runtimeMode === "full-access"
+        ? undefined
+        : ({
+            approvalPolicy: "untrusted",
+            sandboxPolicy: { type: "readOnly" },
+          } as const);
     const startApprovalTurn = (
       scenario: string,
       entries: ReadonlyArray<CodexReplay.CodexAppServerReplayEntry>,
+      runtimeMode: RuntimeMode = ASKS,
     ) =>
       Effect.gen(function* () {
         const pending = yield* Queue.unbounded<OrchestrationV2RuntimeRequest>();
+        const turnPolicy = turnPolicyFor(runtimeMode);
         const harness = yield* makeCodexReplayHarness(
           makeCodexReplayTranscript({
             scenario,
-            entries: [...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }), ...entries],
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId,
+                prompt,
+                ...(turnPolicy === undefined ? {} : { turnPolicy }),
+              }),
+              ...entries,
+            ],
           }),
           (event) =>
             event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending"
               ? Queue.offer(pending, event.runtimeRequest)
               : Effect.void,
         );
-        yield* harness.runtime.startTurn(
-          makeCodexTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now: yield* DateTime.now,
-            attemptId: RunAttemptId.make(`${scenario}-attempt`),
-            text: prompt,
-          }),
-        );
+        const turnInput = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make(`${scenario}-attempt`),
+          text: prompt,
+        });
+        yield* harness.runtime.startTurn({
+          ...turnInput,
+          runtimePolicy: { ...turnInput.runtimePolicy, runtimeMode },
+        });
         return {
           harness,
           answerNext: Queue.take(pending).pipe(
@@ -13828,6 +13855,102 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             [[...manyFiles.map((file) => `add ${file.path}`), "write /w"].join("\n"), reason],
             ["pnpm run build\ncwd /w/app", reason],
           ],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    );
+
+    // The reported bug: a Playwright call on a thread the user had fully approved still stopped
+    // for an approve/deny. Full access answers every kind itself, so nothing reaches the user.
+    it.effect("answers every approval kind itself on full access", () =>
+      Effect.gen(function* () {
+        const reason = "Needed to build the project.";
+        const permissions = {
+          fileSystem: { write: ["/w/out"] },
+          network: { enabled: true },
+        } satisfies CodexSchema.PermissionsRequestApprovalParams["permissions"];
+        const request = (
+          id: number,
+          method: string,
+          params: Record<string, unknown>,
+          result: Record<string, unknown>,
+        ): Array<CodexReplay.CodexAppServerReplayEntry> => [
+          {
+            type: "emit_inbound",
+            label: method,
+            frame: {
+              id,
+              method,
+              params: { threadId: nativeThreadId, turnId: nativeTurnId, startedAtMs: 2, ...params },
+            },
+          },
+          { type: "expect_outbound", label: method, frame: { id, result } },
+        ];
+        const { harness } = yield* startApprovalTurn(
+          "full-access-every-approval",
+          [
+            ...request(
+              0,
+              "item/permissions/requestApproval",
+              { itemId: "permissions", cwd: "/w", reason, permissions },
+              { permissions, scope: "turn" },
+            ),
+            ...request(
+              1,
+              "item/commandExecution/requestApproval",
+              {
+                itemId: "playwright",
+                cwd: "/w/app",
+                reason,
+                command: "npx playwright screenshot https://example.com out.png",
+                networkApprovalContext: { host: "example.com", protocol: "https" },
+              },
+              { decision: "accept" },
+            ),
+            fileChange("started", nativeTurnId, "patch", [addA]),
+            ...request(
+              2,
+              "item/fileChange/requestApproval",
+              { itemId: "patch", reason, grantRoot: "/w" },
+              { decision: "accept" },
+            ),
+            fileChange("completed", nativeTurnId, "patch", [addA]),
+            ...request(
+              3,
+              "execCommandApproval",
+              {
+                callId: "legacy",
+                conversationId: nativeThreadId,
+                command: ["pnpm", "run", "build"],
+                cwd: "/w/app",
+                parsedCmd: [],
+                reason,
+              },
+              { decision: "approved" },
+            ),
+            turnCompleted(nativeTurnId),
+          ],
+          "full-access",
+        );
+        yield* harness.firstTerminal;
+
+        assert.deepEqual(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+              ? [event.turnItem.requestId]
+              : [],
+          ),
+          [],
+          "full access must not surface an approval",
         );
       }).pipe(
         Effect.scoped,

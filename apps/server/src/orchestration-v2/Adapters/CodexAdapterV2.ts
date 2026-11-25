@@ -904,6 +904,20 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 
 const isCodexCyberAccessProgram = Schema.is(CodexSchema.V2TurnStartParams__CyberAccessProgram);
 
+/**
+ * Full access is the user's own grant of everything the agent can do, so an approval that still
+ * reaches F4code under it would strand the turn on a question the user already answered. The
+ * adapters answer those themselves. An explicit policy override (a managed ceiling, or a replay
+ * fixture pinning a policy) is the one thing that keeps the question alive.
+ */
+function answersOwnApprovals(policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy): boolean {
+  return (
+    policy.runtimeMode === "full-access" &&
+    policy.approvalPolicy === undefined &&
+    policy.sandboxPolicy === undefined
+  );
+}
+
 function codexCyberAccess(
   models: ReadonlyArray<ServerProviderModel>,
   model: string,
@@ -6377,14 +6391,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
             }
             // F4's Full access policy is granular, under which Codex still asks before commands it
-            // deems dangerous. Managed-network asks enforce the user's allowlist, so they still ask.
-            if (
-              context.input.runtimePolicy.runtimeMode === "full-access" &&
-              context.input.runtimePolicy.approvalPolicy === undefined &&
-              context.input.runtimePolicy.sandboxPolicy === undefined &&
-              payload.networkApprovalContext == null &&
-              (payload.proposedNetworkPolicyAmendments ?? []).length === 0
-            ) {
+            // deems dangerous and before ones that reach the network. Network asks matter here:
+            // the browser and app tools run through them, so leaving them to the user stopped
+            // every Playwright call on a thread the user had already fully approved.
+            if (answersOwnApprovals(context.input.runtimePolicy)) {
               return {
                 decision: "accept",
               } satisfies CodexSchema.CommandExecutionRequestApprovalResponse;
@@ -6465,6 +6475,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 decision: "acceptForSession",
               } satisfies CodexSchema.FileChangeRequestApprovalResponse;
             }
+            if (answersOwnApprovals(context.input.runtimePolicy)) {
+              return {
+                decision: "accept",
+              } satisfies CodexSchema.FileChangeRequestApprovalResponse;
+            }
 
             const artifacts = yield* buildApprovalRequestArtifacts({
               context,
@@ -6534,6 +6549,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             const requestKind = providerRequestKindFromPermissions(payload.permissions);
+            if (answersOwnApprovals(context.input.runtimePolicy)) {
+              return permissionsResponseFromDecision({
+                decision: "accept",
+                permissions: payload.permissions,
+              });
+            }
             const artifacts = yield* buildApprovalRequestArtifacts({
               context,
               nativeItemId: payload.itemId,
@@ -6684,6 +6705,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 decision: "approved_for_session",
               } satisfies CodexSchema.ExecCommandApprovalResponse;
             }
+            if (answersOwnApprovals(context.input.runtimePolicy)) {
+              return {
+                decision: "approved",
+              } satisfies CodexSchema.ExecCommandApprovalResponse;
+            }
 
             const nativeRequestId = payload.approvalId ?? payload.callId;
             const artifacts = yield* buildApprovalRequestArtifacts({
@@ -6756,6 +6782,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             if (allowance.has("file-change")) {
               return {
                 decision: "approved_for_session",
+              } satisfies CodexSchema.ApplyPatchApprovalResponse;
+            }
+            if (answersOwnApprovals(context.input.runtimePolicy)) {
+              return {
+                decision: "approved",
               } satisfies CodexSchema.ApplyPatchApprovalResponse;
             }
 
