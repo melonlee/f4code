@@ -1,0 +1,14 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "ARK85ZXQ4Z.com.f4code.f4code",
+          "ARK85ZXQ4Z.com.f4code.f4code.preview",
+          "ARK85ZXQ4Z.com.f4code.f4code.dev"
+        ],
+        "components": [{ "/": "/threads/*" }]
+      }
+    ]
+  }
+}

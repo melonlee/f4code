@@ -1,0 +1,814 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
+import * as NodeTls from "node:tls";
+
+import * as NodeStream from "@effect/platform-node/NodeStream";
+import {
+  DesktopHostChannelMessage,
+  type DesktopHostChannelMessage as DesktopHostChannelMessageValue,
+  type DesktopHostSnapshot,
+  type DesktopShellEnvironmentSnapshot,
+  DesktopHostControlMessage,
+  type DesktopUpdateChannel,
+  type DesktopUpdateStatusReport,
+  type ResourceMonitorSourceStatus,
+} from "@f4code/contracts";
+import { resolveServerBackgroundActivitySettings } from "@f4code/shared/backgroundActivitySettings";
+import * as HostProcess from "@f4code/shared/HostProcess";
+import { applyShellEnvironment } from "@f4code/shared/shell";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import * as Ndjson from "effect/encoding/Ndjson";
+
+import { eventVersion as messageVersion } from "./NativeMonitorClient.ts";
+import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { subscribeBeforeSnapshotWithoutMutex } from "../utils/subscribeBeforeSnapshot.ts";
+
+const INITIAL_SAMPLE_DEADLINE_MS = 90_000;
+const MIN_SNAPSHOT_STALE_AFTER_MS = 90_000;
+const STALE_GRACE_MS = 30_000;
+const DEFAULT_HOST_POWER_ACTIVE_INTERVAL_MS = 30_000;
+const DEFAULT_HOST_POWER_IDLE_INTERVAL_MS = 120_000;
+const STALE_CHECK_INTERVAL = Duration.seconds(30);
+
+export class DesktopHostDescriptorUnavailable extends Schema.TaggedError<DesktopHostDescriptorUnavailable>()(
+  "DesktopHostDescriptorUnavailable",
+  {
+    mode: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel descriptor is unavailable in '${this.mode}' mode.`;
+  }
+}
+
+export class DesktopHostProtocolMismatch extends Schema.TaggedError<DesktopHostProtocolMismatch>()(
+  "DesktopHostProtocolMismatch",
+  {
+    expectedVersion: Schema.Number,
+    receivedVersion: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel protocol ${this.receivedVersion} is incompatible with expected protocol ${this.expectedVersion}.`;
+  }
+}
+
+export class DesktopHostDecodeFailed extends Schema.TaggedError<DesktopHostDecodeFailed>()(
+  "DesktopHostDecodeFailed",
+  {
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "Failed to decode desktop host channel.";
+  }
+}
+
+export class DesktopHostStreamFailed extends Schema.TaggedError<DesktopHostStreamFailed>()(
+  "DesktopHostStreamFailed",
+  {
+    fd: Schema.Number,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel stream on fd ${this.fd} failed.`;
+  }
+}
+
+export class DesktopHostStreamClosed extends Schema.TaggedError<DesktopHostStreamClosed>()(
+  "DesktopHostStreamClosed",
+  {
+    fd: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel stream on fd ${this.fd} closed.`;
+  }
+}
+
+export class DesktopHostStale extends Schema.TaggedError<DesktopHostStale>()("DesktopHostStale", {
+  fd: Schema.Number,
+  staleAfterMs: Schema.Number,
+}) {
+  override get message(): string {
+    return `Desktop host channel on fd ${this.fd} has not updated for ${this.staleAfterMs}ms.`;
+  }
+}
+
+export type DesktopHostChannelError =
+  | DesktopHostDescriptorUnavailable
+  | DesktopHostProtocolMismatch
+  | DesktopHostDecodeFailed
+  | DesktopHostStreamFailed
+  | DesktopHostStreamClosed;
+
+export class DesktopHostControlFailed extends Schema.TaggedError<DesktopHostControlFailed>()(
+  "DesktopHostControlFailed",
+  {
+    fd: Schema.Number,
+    operation: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel control '${this.operation}' failed on fd ${this.fd}.`;
+  }
+}
+
+export class DesktopHostControlStalled extends Schema.TaggedError<DesktopHostControlStalled>()(
+  "DesktopHostControlStalled",
+  {
+    fd: Schema.Number,
+    remainingBytes: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Desktop host channel control stalled on fd ${this.fd} with ${this.remainingBytes} bytes remaining.`;
+  }
+}
+
+export type DesktopHostControlError = DesktopHostControlFailed | DesktopHostControlStalled;
+
+export interface DesktopHostChannelHealth {
+  readonly status: ResourceMonitorSourceStatus;
+  readonly lastSampleAt: Option.Option<DateTime.Utc>;
+  readonly lastError: Option.Option<string>;
+}
+
+/** Moves the desktop app to `channel` and installs only `targetVersion`. */
+export interface DesktopTrackSwitch {
+  readonly channel: DesktopUpdateChannel;
+  readonly targetVersion: string;
+}
+
+export class DesktopHostChannel extends Context.Service<
+  DesktopHostChannel,
+  {
+    readonly latest: Effect.Effect<Option.Option<DesktopHostSnapshot>>;
+    readonly changes: Stream.Stream<DesktopHostSnapshot>;
+    readonly subscribe: Effect.Effect<
+      {
+        readonly latest: Option.Option<DesktopHostSnapshot>;
+        readonly changes: Stream.Stream<DesktopHostSnapshot>;
+      },
+      never,
+      Scope.Scope
+    >;
+    /** Emits when a desktop shell environment changes this process's PATH; replays the last one. */
+    readonly pathChanges: Stream.Stream<void>;
+    readonly health: Effect.Effect<DesktopHostChannelHealth>;
+    readonly subscribeHealth: Effect.Effect<
+      {
+        readonly latest: DesktopHostChannelHealth;
+        readonly changes: Stream.Stream<DesktopHostChannelHealth>;
+      },
+      never,
+      Scope.Scope
+    >;
+    readonly setDiagnosticsDemand: (
+      enabled: boolean,
+    ) => Effect.Effect<void, DesktopHostControlError>;
+    /** Tells the desktop parent that the server accepts requests, so it can skip readiness polling. */
+    readonly announceServerReady: Effect.Effect<void, DesktopHostControlError>;
+    readonly requestDesktopUpdate: (
+      requestId: string,
+      trackSwitch?: DesktopTrackSwitch,
+    ) => Effect.Effect<void, DesktopHostControlError>;
+    readonly commitDesktopUpdate: (
+      requestId: string,
+    ) => Effect.Effect<void, DesktopHostControlError>;
+    readonly cancelDesktopUpdate: (
+      requestId: string,
+    ) => Effect.Effect<void, DesktopHostControlError>;
+    readonly desktopUpdates: Effect.Effect<
+      {
+        readonly latest: Option.Option<DesktopUpdateStatusReport>;
+        readonly changes: Stream.Stream<DesktopUpdateStatusReport>;
+      },
+      never,
+      Scope.Scope
+    >;
+  }
+>()("f4/resourceMonitor/DesktopHostChannel") {}
+
+class DesktopShellCertificatesUpdateFailed extends Schema.TaggedError<DesktopShellCertificatesUpdateFailed>()(
+  "DesktopShellCertificatesUpdateFailed",
+  { cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return "Failed to update desktop shell TLS certificates.";
+  }
+}
+
+export function makeApplyDesktopShellEnvironmentSnapshot(
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+) {
+  let baseCertificates: Array<string> | undefined;
+  return Effect.fn("resourceMonitor.desktopHostChannel.applyShellEnvironment")(function* (
+    message: DesktopShellEnvironmentSnapshot,
+  ) {
+    if (message.platform !== platform) return;
+    // Node's first default-CA enumeration consults process.env, so capture it before the patch.
+    if (message.environment.NODE_EXTRA_CA_CERTS !== undefined && baseCertificates === undefined) {
+      // Remove only the startup extras, preserving duplicates from bundled or system trust.
+      const extras = [...NodeTls.getCACertificates("extra")];
+      baseCertificates = NodeTls.getCACertificates("default").filter((certificate) => {
+        const index = extras.indexOf(certificate);
+        if (index === -1) return true;
+        extras.splice(index, 1);
+        return false;
+      });
+    }
+    applyShellEnvironment(environment, message.environment, platform);
+    if (message.environment.NODE_EXTRA_CA_CERTS !== undefined) {
+      yield* Effect.gen(function* () {
+        const certificates = baseCertificates;
+        // --use-openssl-ca roots are not enumerable; replacing the list would discard them.
+        if (certificates === undefined || certificates.length === 0) {
+          yield* Effect.logWarning(
+            "Preserving non-enumerable TLS trust. Restart to apply updated desktop shell certificates.",
+          );
+          return;
+        }
+        const fs = yield* FileSystem.FileSystem;
+        const file = message.environment.NODE_EXTRA_CA_CERTS;
+        const bundle = file ? yield* fs.readFileString(file) : undefined;
+        yield* Effect.try({
+          try: () => {
+            const extras =
+              bundle?.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+            if (bundle?.trim() && extras.length === 0) {
+              throw new Error("No PEM certificates found.");
+            }
+            NodeTls.setDefaultCACertificates([...certificates, ...extras]);
+          },
+          catch: (cause) => new DesktopShellCertificatesUpdateFailed({ cause }),
+        });
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Failed to update desktop shell TLS certificates.", Cause.fail(cause)),
+        ),
+      );
+    }
+    if (message.discovered) delete environment.F4CODE_DESKTOP_SHELL_DISCOVERY_PENDING;
+  });
+}
+
+const decodeMessage = Schema.decodeUnknownEffect(DesktopHostChannelMessage);
+const encodeControlMessage = Schema.encodeEffect(Schema.fromJsonString(DesktopHostControlMessage));
+const isDescriptorUnavailable = Schema.is(DesktopHostDescriptorUnavailable);
+const isProtocolMismatch = Schema.is(DesktopHostProtocolMismatch);
+const isDecodeFailed = Schema.is(DesktopHostDecodeFailed);
+const isStreamFailed = Schema.is(DesktopHostStreamFailed);
+
+function isDesktopHostContactStale(lastContactAtMs: Option.Option<number>, nowMs: number): boolean {
+  return Option.exists(
+    lastContactAtMs,
+    (lastContact) => nowMs - lastContact >= INITIAL_SAMPLE_DEADLINE_MS,
+  );
+}
+
+function resolveDesktopHostSnapshotStaleAfterMs(
+  activeIntervalMs: number,
+  idleIntervalMs: number,
+): number {
+  return Math.max(
+    MIN_SNAPSHOT_STALE_AFTER_MS,
+    Math.max(activeIntervalMs, idleIntervalMs) + STALE_GRACE_MS,
+  );
+}
+
+function initialDesktopHostContactAt(
+  desktopHostFd: number | undefined,
+  nowMs: number,
+): Option.Option<number> {
+  return desktopHostFd === undefined ? Option.none() : Option.some(nowMs);
+}
+
+const recordDesktopHostSampleHealth = Effect.fn(
+  "resourceMonitor.desktopHostChannel.recordSampleHealth",
+)(function* (
+  health: Ref.Ref<DesktopHostChannelHealth>,
+  healthChanges: PubSub.PubSub<DesktopHostChannelHealth>,
+  sampledAt: DateTime.Utc,
+) {
+  const next: DesktopHostChannelHealth = {
+    status: "healthy",
+    lastSampleAt: Option.some(sampledAt),
+    lastError: Option.none(),
+  };
+  yield* Ref.set(health, next);
+  yield* PubSub.publish(healthChanges, next);
+});
+
+function normalizeReceiverError(error: unknown): DesktopHostChannelError {
+  if (
+    isDescriptorUnavailable(error) ||
+    isProtocolMismatch(error) ||
+    isDecodeFailed(error) ||
+    isStreamFailed(error)
+  ) {
+    return error;
+  }
+  return new DesktopHostDecodeFailed({ cause: error });
+}
+
+export const writeAllToFileDescriptor = Effect.fn(
+  "resourceMonitor.desktopHostChannel.writeAllToFileDescriptor",
+)(function* (fd: number, payload: Buffer) {
+  let offset = 0;
+  while (offset < payload.byteLength) {
+    const written = yield* Effect.callback<number, DesktopHostControlFailed>((resume, signal) => {
+      if (signal.aborted) return;
+      try {
+        NodeFS.write(
+          fd,
+          payload,
+          offset,
+          payload.byteLength - offset,
+          null,
+          (error, bytesWritten) => {
+            if (error) {
+              resume(
+                Effect.fail(
+                  new DesktopHostControlFailed({
+                    fd,
+                    operation: "write",
+                    cause: error,
+                  }),
+                ),
+              );
+              return;
+            }
+            resume(Effect.succeed(bytesWritten));
+          },
+        );
+      } catch (cause) {
+        resume(
+          Effect.fail(
+            new DesktopHostControlFailed({
+              fd,
+              operation: "write",
+              cause,
+            }),
+          ),
+        );
+      }
+    });
+    yield* requireDesktopHostWriteProgress(fd, payload.byteLength - offset, written);
+    offset += written;
+  }
+});
+
+export function requireDesktopHostWriteProgress(
+  fd: number,
+  remainingBytes: number,
+  written: number,
+): Effect.Effect<void, DesktopHostControlStalled> {
+  return written > 0
+    ? Effect.void
+    : Effect.fail(new DesktopHostControlStalled({ fd, remainingBytes }));
+}
+
+export const makeDesktopShellEnvironmentUpdates = Effect.fn(
+  "DesktopTelemetryReceiver.makeDesktopShellEnvironmentUpdates",
+)(function* (environment: NodeJS.ProcessEnv, platform: NodeJS.Platform) {
+  const applyShellEnvironment = makeApplyDesktopShellEnvironmentSnapshot(environment, platform);
+  // Replayed, because the provider watcher may subscribe after the snapshot arrived.
+  const pathChanges = yield* Effect.acquireRelease(
+    PubSub.sliding<void>({ capacity: 1, replay: 1 }),
+    PubSub.shutdown,
+  );
+  const readPath = () => environment.PATH ?? environment.Path;
+  // Untraced: applyShellEnvironment already carries this operation's span.
+  const apply = Effect.fnUntraced(function* (message: DesktopShellEnvironmentSnapshot) {
+    const before = readPath();
+    yield* applyShellEnvironment(message);
+    if (readPath() !== before) yield* PubSub.publish(pathChanges, undefined);
+  });
+  return { apply, pathChanges: Stream.fromPubSub(pathChanges) };
+});
+
+/** @public */
+export const make = Effect.fn("resourceMonitor.desktopHostChannel.make")(function* () {
+  const config = yield* ServerConfig.ServerConfig;
+  const environment = yield* HostProcess.Environment;
+  const platform = yield* HostProcess.Platform;
+  const shellEnvironment = yield* makeDesktopShellEnvironmentUpdates(environment, platform);
+  const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const latest = yield* Ref.make(Option.none<DesktopHostSnapshot>());
+  const receiverStartedAt = yield* DateTime.now;
+  const lastContactAtMs = yield* Ref.make(
+    initialDesktopHostContactAt(config.desktopHostFd, DateTime.toEpochMillis(receiverStartedAt)),
+  );
+  const snapshotStaleAfterMs = yield* Ref.make(
+    resolveDesktopHostSnapshotStaleAfterMs(
+      DEFAULT_HOST_POWER_ACTIVE_INTERVAL_MS,
+      DEFAULT_HOST_POWER_IDLE_INTERVAL_MS,
+    ),
+  );
+  const changes = yield* PubSub.sliding<DesktopHostSnapshot>(8);
+  const healthChanges = yield* PubSub.sliding<DesktopHostChannelHealth>(4);
+  const latestUpdateReport = yield* Ref.make(Option.none<DesktopUpdateStatusReport>());
+  const updateReportChanges = yield* PubSub.sliding<DesktopUpdateStatusReport>(16);
+  const controlMutex = yield* Semaphore.make(1);
+  const snapshotMutex = yield* Semaphore.make(1);
+  const health = yield* Ref.make<DesktopHostChannelHealth>({
+    status: config.desktopHostFd === undefined ? "unavailable" : "starting",
+    lastSampleAt: Option.none(),
+    lastError:
+      config.desktopHostFd === undefined
+        ? Option.some(
+            new DesktopHostDescriptorUnavailable({
+              mode: config.mode,
+            }).message,
+          )
+        : Option.none(),
+  });
+  const updateHealth = (update: (current: DesktopHostChannelHealth) => DesktopHostChannelHealth) =>
+    Ref.modify(health, (current) => {
+      const next = update(current);
+      return [next, next];
+    }).pipe(
+      Effect.flatMap((next) => PubSub.publish(healthChanges, next)),
+      Effect.asVoid,
+    );
+  const updateSampleHealth = (sampledAt: DateTime.Utc) =>
+    recordDesktopHostSampleHealth(health, healthChanges, sampledAt);
+
+  const sendControlMessage = (message: DesktopHostControlMessage) =>
+    controlMutex.withPermits(1)(
+      Effect.gen(function* () {
+        const fd = config.desktopHostControlFd;
+        if (fd === undefined) return;
+        const encoded = yield* encodeControlMessage(message).pipe(
+          Effect.mapError(
+            (cause) =>
+              new DesktopHostControlFailed({
+                fd,
+                operation: "encode",
+                cause,
+              }),
+          ),
+        );
+        yield* writeAllToFileDescriptor(fd, Buffer.from(`${encoded}\n`)).pipe(
+          Effect.tapError((error) =>
+            updateHealth((current) => ({
+              ...current,
+              status: "degraded",
+              lastError: Option.some(error.message),
+            })),
+          ),
+        );
+      }),
+    );
+  const setDiagnosticsDemand: DesktopHostChannel["Service"]["setDiagnosticsDemand"] = (enabled) =>
+    sendControlMessage({
+      version: 1,
+      type: "setDiagnosticsDemand",
+      enabled,
+    });
+
+  const sendHostPowerIntervals = (
+    settings: Parameters<typeof resolveServerBackgroundActivitySettings>[0],
+  ) => {
+    const resolved = resolveServerBackgroundActivitySettings(settings);
+    const activeIntervalMs = Math.max(
+      1,
+      Math.round(Duration.toMillis(resolved.hostPowerMonitorActiveInterval)),
+    );
+    const idleIntervalMs = Math.max(
+      1,
+      Math.round(Duration.toMillis(resolved.hostPowerMonitorIdleInterval)),
+    );
+    return sendControlMessage({
+      version: 1,
+      type: "setHostPowerIntervals",
+      activeIntervalMs,
+      idleIntervalMs,
+    }).pipe(
+      Effect.andThen(
+        Ref.set(
+          snapshotStaleAfterMs,
+          resolveDesktopHostSnapshotStaleAfterMs(activeIntervalMs, idleIntervalMs),
+        ),
+      ),
+    );
+  };
+  if (config.desktopHostControlFd !== undefined) {
+    const settingsChanges = yield* serverSettings.subscribeChanges;
+    const settings = yield* serverSettings.getSettings;
+    yield* sendHostPowerIntervals(settings).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to configure desktop host-power intervals", {
+          cause: String(cause),
+        }),
+      ),
+    );
+    yield* settingsChanges.pipe(
+      Stream.runForEach((settings) =>
+        sendHostPowerIntervals(settings).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to update desktop host-power intervals", {
+              cause: String(cause),
+            }),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
+    );
+  }
+
+  if (config.desktopHostFd !== undefined) {
+    const fd = config.desktopHostFd;
+    // The parent waits before closing; use cancellable socket reads so filesystem reads cannot block exit.
+    const readable = yield* Effect.acquireRelease(
+      Effect.try({
+        try: () => new NodeNet.Socket({ fd, readable: true, writable: false }),
+        catch: (cause) => new DesktopHostStreamFailed({ fd, cause }),
+      }),
+      (stream) =>
+        Effect.sync(() => {
+          stream.destroy();
+        }),
+    );
+
+    const messages: Stream.Stream<DesktopHostChannelMessageValue, DesktopHostChannelError> =
+      NodeStream.fromReadable<Uint8Array, DesktopHostStreamFailed>({
+        evaluate: () => readable,
+        closeOnDone: true,
+        onError: (cause) => new DesktopHostStreamFailed({ fd, cause }),
+      }).pipe(
+        Stream.pipeThroughChannel(Ndjson.decode({ ignoreEmptyLines: true })),
+        Stream.mapEffect(
+          (
+            value,
+          ): Effect.Effect<
+            DesktopHostChannelMessageValue,
+            DesktopHostProtocolMismatch | DesktopHostDecodeFailed
+          > => {
+            const version = messageVersion(value);
+            if (version !== undefined && version !== 1) {
+              return Effect.fail(
+                new DesktopHostProtocolMismatch({
+                  expectedVersion: 1,
+                  receivedVersion: version,
+                }),
+              );
+            }
+            return decodeMessage(value).pipe(
+              Effect.mapError((cause) => new DesktopHostDecodeFailed({ cause })),
+            );
+          },
+        ),
+        Stream.mapError(normalizeReceiverError),
+      );
+
+    yield* messages.pipe(
+      Stream.runForEach((message) => {
+        const recordContact = DateTime.now.pipe(
+          Effect.flatMap((now) =>
+            Ref.set(lastContactAtMs, Option.some(DateTime.toEpochMillis(now))),
+          ),
+        );
+        if (message.type === "desktopHostHello") {
+          return recordContact.pipe(
+            Effect.andThen(
+              updateHealth((current): DesktopHostChannelHealth => ({
+                ...current,
+                status: "healthy",
+                lastError: Option.none(),
+              })),
+            ),
+          );
+        }
+
+        if (message.type === "shellEnvironment") {
+          return recordContact.pipe(Effect.andThen(shellEnvironment.apply(message)));
+        }
+
+        if (message.type === "desktopUpdateStatus") {
+          return recordContact.pipe(
+            Effect.andThen(Ref.set(latestUpdateReport, Option.some(message))),
+            Effect.andThen(PubSub.publish(updateReportChanges, message)),
+            Effect.asVoid,
+          );
+        }
+
+        const sampledAt = DateTime.makeUnsafe(message.sampledAtUnixMs);
+        return snapshotMutex.withPermits(1)(
+          recordContact.pipe(
+            Effect.andThen(Ref.set(latest, Option.some(message))),
+            Effect.andThen(updateSampleHealth(sampledAt)),
+            Effect.andThen(PubSub.publish(changes, message)),
+            Effect.asVoid,
+          ),
+        );
+      }),
+      Effect.andThen(
+        updateHealth((current): DesktopHostChannelHealth => ({
+          ...current,
+          status: "stopped",
+          lastError: Option.some(new DesktopHostStreamClosed({ fd }).message),
+        })),
+      ),
+      Effect.catch((error) =>
+        updateHealth((current): DesktopHostChannelHealth => ({
+          ...current,
+          status: "degraded",
+          lastError: Option.some(error.message),
+        })),
+      ),
+      Effect.forkScoped,
+    );
+
+    yield* Effect.forever(
+      Effect.sleep(STALE_CHECK_INTERVAL).pipe(
+        Effect.andThen(
+          snapshotMutex.withPermits(1)(
+            Effect.gen(function* () {
+              const now = yield* DateTime.now;
+              const nowMs = DateTime.toEpochMillis(now);
+              const staleAfterMs = yield* Ref.get(snapshotStaleAfterMs);
+              const staleSnapshot = yield* Ref.modify(latest, (current) => {
+                if (
+                  Option.isNone(current) ||
+                  current.value.power.stale ||
+                  nowMs - current.value.sampledAtUnixMs < staleAfterMs
+                ) {
+                  return [Option.none<DesktopHostSnapshot>(), current] as const;
+                }
+                const stale: DesktopHostSnapshot = {
+                  ...current.value,
+                  power: { ...current.value.power, stale: true },
+                };
+                return [Option.some(stale), Option.some(stale)] as const;
+              });
+              if (Option.isNone(staleSnapshot)) {
+                const lastContact = yield* Ref.get(lastContactAtMs);
+                if (!isDesktopHostContactStale(lastContact, nowMs)) return;
+                const staleMessage = new DesktopHostStale({
+                  fd,
+                  staleAfterMs: INITIAL_SAMPLE_DEADLINE_MS,
+                }).message;
+                const changed = yield* Ref.modify(health, (current) => {
+                  if (
+                    current.status === "stopped" ||
+                    Option.isSome(current.lastSampleAt) ||
+                    (current.status === "degraded" &&
+                      Option.contains(current.lastError, staleMessage))
+                  ) {
+                    return [Option.none<DesktopHostChannelHealth>(), current] as const;
+                  }
+                  const next: DesktopHostChannelHealth = {
+                    ...current,
+                    status: "degraded",
+                    lastError: Option.some(staleMessage),
+                  };
+                  return [Option.some(next), next] as const;
+                });
+                if (Option.isSome(changed)) {
+                  yield* PubSub.publish(healthChanges, changed.value);
+                }
+                return;
+              }
+              yield* updateHealth((currentHealth) => ({
+                ...currentHealth,
+                status: currentHealth.status === "stopped" ? "stopped" : "degraded",
+                lastError:
+                  currentHealth.status === "stopped"
+                    ? currentHealth.lastError
+                    : Option.some(new DesktopHostStale({ fd, staleAfterMs }).message),
+              }));
+              yield* PubSub.publish(changes, staleSnapshot.value);
+            }),
+          ),
+        ),
+      ),
+    ).pipe(Effect.forkScoped);
+  }
+
+  return DesktopHostChannel.of({
+    latest: Ref.get(latest),
+    changes: Stream.fromPubSub(changes),
+    pathChanges: shellEnvironment.pathChanges,
+    subscribe: snapshotMutex.withPermits(1)(
+      Effect.gen(function* () {
+        const initial = yield* Ref.get(latest);
+        const subscription = yield* PubSub.subscribe(changes);
+        return {
+          latest: initial,
+          changes: Stream.fromSubscription(subscription),
+        };
+      }),
+    ),
+    health: Ref.get(health),
+    subscribeHealth: subscribeBeforeSnapshotWithoutMutex(healthChanges, Ref.get(health)),
+    setDiagnosticsDemand,
+    announceServerReady: sendControlMessage({ version: 1, type: "serverReady" }).pipe(
+      Effect.withSpan("DesktopHostChannel.announceServerReady"),
+    ),
+    requestDesktopUpdate: Effect.fn("DesktopHostChannel.requestDesktopUpdate")(
+      function (requestId, trackSwitch) {
+        return sendControlMessage({
+          version: 1,
+          type: "requestDesktopUpdate",
+          requestId,
+          ...trackSwitch,
+        });
+      },
+    ),
+    commitDesktopUpdate: Effect.fn("DesktopHostChannel.commitDesktopUpdate")(function (requestId) {
+      return sendControlMessage({ version: 1, type: "commitDesktopUpdate", requestId });
+    }),
+    cancelDesktopUpdate: Effect.fn("DesktopHostChannel.cancelDesktopUpdate")(function (requestId) {
+      return sendControlMessage({ version: 1, type: "cancelDesktopUpdate", requestId });
+    }),
+    desktopUpdates: Effect.gen(function* () {
+      const subscription = yield* PubSub.subscribe(updateReportChanges);
+      const initial = yield* Ref.get(latestUpdateReport);
+      return {
+        latest: initial,
+        changes: Stream.fromSubscription(subscription),
+      };
+    }),
+  });
+});
+
+export const layer = Layer.effect(DesktopHostChannel, make());
+
+export const layerTest = (
+  overrides: Partial<DesktopHostChannel["Service"]> = {},
+): Layer.Layer<DesktopHostChannel> => {
+  const latest = overrides.latest ?? Effect.succeedNone;
+  const changes = overrides.changes ?? Stream.empty;
+  const health =
+    overrides.health ??
+    Effect.succeed({
+      status: "unavailable" as const,
+      lastSampleAt: Option.none<DateTime.Utc>(),
+      lastError: Option.some("Desktop host channel test implementation is unavailable."),
+    });
+  return Layer.succeed(
+    DesktopHostChannel,
+    DesktopHostChannel.of({
+      latest,
+      changes,
+      pathChanges: overrides.pathChanges ?? Stream.empty,
+      subscribe:
+        overrides.subscribe ??
+        latest.pipe(
+          Effect.map((initial) => ({
+            latest: initial,
+            changes,
+          })),
+        ),
+      health,
+      subscribeHealth:
+        overrides.subscribeHealth ??
+        health.pipe(
+          Effect.map((initial) => ({
+            latest: initial,
+            changes: Stream.empty,
+          })),
+        ),
+      setDiagnosticsDemand: Effect.fn("DesktopHostChannel.setDiagnosticsDemand")(function () {
+        return Effect.void;
+      }),
+      announceServerReady: Effect.void,
+      requestDesktopUpdate: Effect.fn("DesktopHostChannel.requestDesktopUpdate")(function () {
+        return Effect.void;
+      }),
+      commitDesktopUpdate: Effect.fn("DesktopHostChannel.commitDesktopUpdate")(function () {
+        return Effect.void;
+      }),
+      cancelDesktopUpdate: Effect.fn("DesktopHostChannel.cancelDesktopUpdate")(function () {
+        return Effect.void;
+      }),
+      desktopUpdates:
+        overrides.desktopUpdates ??
+        Effect.succeed({
+          latest: Option.none<DesktopUpdateStatusReport>(),
+          changes: Stream.empty,
+        }),
+      ...overrides,
+    }),
+  );
+};

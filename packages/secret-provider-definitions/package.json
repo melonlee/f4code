@@ -1,0 +1,18 @@
+{
+  "name": "@f4code/secret-provider-definitions",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./registry": {
+      "types": "./src/registry.ts",
+      "import": "./src/registry.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "effect-tsgo tsrs --noEmit"
+  },
+  "dependencies": {
+    "@f4code/secret-provider-core": "workspace:*",
+    "@f4code/secret-provider-onepassword": "workspace:*"
+  }
+}

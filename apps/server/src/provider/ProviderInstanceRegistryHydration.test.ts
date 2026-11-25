@@ -1,0 +1,330 @@
+import {
+  DEFAULT_SERVER_SETTINGS,
+  InferenceServerId,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  SecretProviderId,
+  SecretProviderKind,
+  type ServerSettings,
+} from "@f4code/contracts";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ProviderHost from "@f4code/provider-core/server/ProviderHost";
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
+import { describe, expect, it } from "vite-plus/test";
+
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+import * as ServerConfig from "../config.ts";
+import * as PortScanner from "../preview/PortScanner.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import {
+  DEV_REPLAY_INSTANCE_ID,
+  deriveProviderInstanceConfigMap,
+  layerSettingsWatcher,
+  providerHostLayer,
+  seedDevReplayInstance,
+  seedLocalAgentInstances,
+} from "./ProviderInstanceRegistryHydration.ts";
+import * as ProviderHostLive from "./ProviderHostLive.ts";
+import { ProviderInstanceRegistryMutator } from "./ProviderInstanceRegistryMutator.ts";
+
+const projectId = ProjectId.make("project-a");
+const instanceId = ProviderInstanceId.make("codex_work");
+
+function settingsWith(overrides: Partial<ServerSettings>): ServerSettings {
+  return { ...DEFAULT_SERVER_SETTINGS, ...overrides };
+}
+
+describe("deriveProviderInstanceConfigMap", () => {
+  it("turns a machine-disabled instance on when a project enables it", () => {
+    const settings = settingsWith({
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: false },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+      },
+    });
+
+    const merged = deriveProviderInstanceConfigMap(settings);
+
+    expect(merged[instanceId]).toEqual({ driver: ProviderDriverKind.make("codex"), enabled: true });
+  });
+
+  it("clears a nested config.enabled:false flag when a project enables the instance", () => {
+    const settings = settingsWith({
+      providerInstances: {
+        [instanceId]: {
+          driver: ProviderDriverKind.make("codex"),
+          config: { enabled: false },
+        },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+      },
+    });
+
+    const merged = deriveProviderInstanceConfigMap(settings);
+
+    expect(merged[instanceId]).toEqual({
+      driver: ProviderDriverKind.make("codex"),
+      enabled: true,
+      config: { enabled: true },
+    });
+  });
+
+  it("does not revive an instance a project override references but settings no longer configure", () => {
+    const settings = settingsWith({
+      providerInstances: {},
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+      },
+    });
+
+    const merged = deriveProviderInstanceConfigMap(settings);
+
+    expect(merged[instanceId]).toBeUndefined();
+  });
+
+  it("ignores a project override that disables an instance, leaving the machine's config in charge", () => {
+    const settings = settingsWith({
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: false } } },
+      },
+    });
+
+    const merged = deriveProviderInstanceConfigMap(settings);
+
+    expect(merged[instanceId]).toBe(settings.providerInstances[instanceId]);
+  });
+  it("marks an instance local only while its linked inference server is enabled", () => {
+    const rtx = InferenceServerId.make("rtx");
+    const pi = ProviderDriverKind.make("pi");
+    const derive = (inferenceServers: ServerSettings["inferenceServers"]) =>
+      deriveProviderInstanceConfigMap(
+        settingsWith({
+          providerInstances: {
+            [instanceId]: { driver: pi, inference: "local", inferenceServerId: rtx },
+          },
+          inferenceServers,
+        }),
+      )[instanceId];
+    const server = { baseUrl: "http://rtx:8888/v1", apiKey: "" };
+
+    expect(derive({ [rtx]: { ...server, enabled: true } })).toEqual({
+      driver: pi,
+      inference: "local",
+      inferenceServerId: rtx,
+    });
+    // The link stays visible, but a server that is off or gone does not vouch for locality.
+    expect(derive({ [rtx]: { ...server, enabled: false } })).toEqual({
+      driver: pi,
+      inferenceServerId: rtx,
+    });
+    expect(derive({})).toEqual({ driver: pi, inferenceServerId: rtx });
+  });
+});
+
+describe("seedLocalAgentInstances", () => {
+  effectIt.effect("switches on found local agents and leaves configured ones alone", () =>
+    Effect.gen(function* () {
+      const driver = (name: string) => ProviderDriverKind.make(name);
+      yield* seedLocalAgentInstances([
+        { driver: driver("pi"), found: Effect.succeed(true) },
+        { driver: driver("opencode"), found: Effect.succeed(false) },
+        { driver: driver("noname"), found: Effect.succeed(true) },
+      ]);
+      const settings = yield* ServerSettingsService;
+      const instances = (yield* settings.getSettings).providerInstances;
+      expect(instances[ProviderInstanceId.make("pi")]).toEqual({
+        driver: driver("pi"),
+        enabled: false,
+      });
+      expect(instances[ProviderInstanceId.make("opencode")]).toBeUndefined();
+      expect(instances[ProviderInstanceId.make("noname")]).toEqual({
+        driver: driver("noname"),
+        enabled: true,
+      });
+    }).pipe(
+      Effect.provide(
+        ServerSettingsService.layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("pi")]: {
+              driver: ProviderDriverKind.make("pi"),
+              enabled: false,
+            },
+          },
+        }).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    ),
+  );
+});
+
+describe("seedDevReplayInstance", () => {
+  const seed = (devUrl: URL | undefined) =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* seedDevReplayInstance().pipe(
+        Effect.provideService(ServerConfig.ServerConfig, { ...config, devUrl }),
+      );
+      const settings = yield* ServerSettingsService;
+      return (yield* settings.getSettings).providerInstances[DEV_REPLAY_INSTANCE_ID];
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerConfig.layerTest(process.cwd(), { prefix: "f4-dev-replay-seed-" }),
+          ServerSettingsService.layerTest({
+            providerInstances: {
+              [DEV_REPLAY_INSTANCE_ID]: {
+                driver: ProviderDriverKind.make("acpRegistry"),
+                displayName: "My replay",
+                enabled: false,
+                config: { source: "local", commandPath: "/old/node" },
+              },
+            },
+          }),
+        ).pipe(Layer.provideMerge(NodeServices.layer)),
+      ),
+    );
+
+  effectIt.effect("leaves settings alone outside dev", () =>
+    seed(undefined).pipe(
+      Effect.map((instance) =>
+        expect(instance?.config).toEqual({ source: "local", commandPath: "/old/node" }),
+      ),
+    ),
+  );
+
+  effectIt.effect("points a dev server at the replay agent and keeps user edits", () =>
+    seed(new URL("http://localhost:5733")).pipe(
+      Effect.map((instance) => {
+        expect(instance?.displayName).toBe("My replay");
+        expect(instance?.enabled).toBe(false);
+        expect(instance?.config).toMatchObject({
+          source: "local",
+          commandArgs: [expect.stringMatching(/scripts[/\\]dev-replay-agent\.ts$/)],
+        });
+      }),
+    ),
+  );
+});
+
+describe("layerSettingsWatcher", () => {
+  const provider = (label: string) => ({
+    [SecretProviderId.make("personal")]: {
+      kind: SecretProviderKind.make("one_password"),
+      label,
+      config: { account: "my" },
+    },
+  });
+
+  const watch = (initial: ServerSettings | undefined) =>
+    Effect.gen(function* () {
+      const changes = yield* Queue.unbounded<ServerSettings>();
+      const reconciled = yield* Queue.unbounded<void>();
+      let reloads = 0;
+      const mutator = Layer.succeed(ProviderInstanceRegistryMutator, {
+        reconcile: () => Queue.offer(reconciled, undefined),
+        reloadSecrets: () => Effect.sync(() => void reloads++),
+        rebuild: () => Effect.void,
+        applySecret: () => Effect.succeed([]),
+      });
+      yield* Layer.build(
+        layerSettingsWatcher(Stream.fromQueue(changes), initial).pipe(Layer.provide(mutator)),
+      );
+      return {
+        reloads: () => reloads,
+        // Changes run one at a time, so the repeat's reconcile means the first one's reload decision is done.
+        change: (settings: ServerSettings) =>
+          Queue.offerAll(changes, [settings, settings]).pipe(
+            Effect.andThen(Queue.take(reconciled)),
+            Effect.andThen(Queue.take(reconciled)),
+          ),
+      };
+    });
+
+  effectIt.effect(
+    "retries unreadable secrets when a secret provider changes, not when it is renamed",
+    () =>
+      Effect.gen(function* () {
+        const settings = yield* ServerSettingsService;
+        const { reloads, change } = yield* watch(yield* settings.getSettings);
+
+        yield* change(yield* settings.updateSettings({ secretProviders: provider("Personal") }));
+        expect(reloads()).toBe(1);
+
+        // A label is not read by any vault, so renaming a provider retries nothing.
+        yield* change(yield* settings.updateSettings({ secretProviders: provider("Renamed") }));
+        expect(reloads()).toBe(1);
+      }).pipe(Effect.scoped, Effect.provide(ServerSettingsService.layerTest())),
+  );
+
+  effectIt.effect(
+    "compares a change queued during startup with the settings the registry started from",
+    () =>
+      Effect.gen(function* () {
+        const settings = yield* ServerSettingsService;
+        const started = yield* settings.getSettings;
+        const saved = yield* settings.updateSettings({ secretProviders: provider("Personal") });
+        const { reloads, change } = yield* watch(started);
+
+        yield* change(saved);
+
+        expect(reloads()).toBe(1);
+      }).pipe(Effect.scoped, Effect.provide(ServerSettingsService.layerTest())),
+  );
+});
+
+describe("providerHostLayer", () => {
+  const layerHostDeps = ServerConfig.layerTest(process.cwd(), {
+    prefix: "provider-host-hydration-test",
+  }).pipe(
+    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+    Layer.provideMerge(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
+    Layer.provideMerge(Layer.mock(BackgroundPolicy.BackgroundPolicy)({})),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+  );
+
+  effectIt.effect(
+    "gives drivers trackAgent when a host without PortDiscovery was built first",
+    () =>
+      Effect.gen(function* () {
+        const seen = new Map<string, ProviderHost.ProviderHost["Service"]>();
+        const capture = (label: string) =>
+          Layer.effectDiscard(
+            Effect.map(ProviderHost.ProviderHost, (host) => {
+              seen.set(label, host);
+            }),
+          );
+        // Like server.ts: the ACP registry builds ProviderHostLive.layer before PortDiscovery exists.
+        const early = capture("early").pipe(
+          Layer.provide(ProviderHostLive.layer),
+          Layer.provide(layerHostDeps),
+        );
+        const hydrated = capture("hydrated").pipe(
+          Layer.provide(providerHostLayer),
+          Layer.provide(
+            Layer.mock(PortScanner.PortDiscovery)({ trackAgent: () => () => undefined }),
+          ),
+          Layer.provide(layerHostDeps),
+        );
+        // Build in order on one memo map, so a reused early host would fail the hydrated check.
+        const memoMap = yield* Layer.makeMemoMap;
+        const scope = yield* Effect.scope;
+        yield* Layer.buildWithMemoMap(early, memoMap, scope);
+        yield* Layer.buildWithMemoMap(hydrated, memoMap, scope);
+        expect(seen.size).toBe(2);
+        expect(seen.get("early")?.trackAgent).toBeUndefined();
+        expect(seen.get("hydrated")?.trackAgent).toBeTypeOf("function");
+      }),
+  );
+});

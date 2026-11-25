@@ -1,0 +1,49 @@
+name: PR sweep
+
+on:
+  schedule:
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: pr-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Claude credentials
+        id: claude
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: echo "available=$([ -n "$KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up dependencies
+        if: steps.claude.outputs.available == 'true'
+        uses: ./.github/actions/setup-ci-deps
+
+      - name: Claude sweeps open pull requests
+        if: steps.claude.outputs.available == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: --max-turns 120 --allowedTools "Bash,Read,Edit,Write,Grep,Glob"
+          prompt: |
+            Go through every open pull request in ${{ github.repository }} that targets main (use `gh pr list`). For each one, oldest first:
+            1. Merge it onto a scratch branch from main. If it conflicts, try to resolve the conflicts. If the PR's idea is already covered by main, comment and move on.
+            2. Rules the merged result must keep: no telemetry, analytics, tracing, Sentry, PostHog, OpenTelemetry or Clerk may come back; files in scripts/fork-protected.txt must stay byte-identical to main (if the PR changes them, restore main's version of those files); upstream's database migrations are renumbered after the fork's own, so a PR that adds a migration must use the next free ID.
+            3. Fix what is broken: type errors, tests the PR itself broke, import paths. Run scripts/check-fork-invariants.sh, scripts/check-fork-protected.sh origin/main, scripts/typecheck-all.sh, and the tests of the files the PR touches. Compare any failing test with main before blaming the PR.
+            4. If everything passes and the change is small and clearly correct, merge it into main with `gh pr merge --merge` after pushing your fixes to its branch (or to main directly if the branch is not writable). If it changes security-sensitive code (auth, TLS, keys, permissions), the data directory or runtime identity, or is over 1000 lines, do not merge: leave a review comment saying what you checked and what a human should decide.
+            5. If you cannot make it pass, leave a comment on the PR with the exact failure and move on.
+            Never force-push main. Stop after all PRs are handled and write a short summary.

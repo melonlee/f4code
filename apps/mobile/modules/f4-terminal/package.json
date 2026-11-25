@@ -1,0 +1,17 @@
+{
+  "name": "@f4code/mobile-terminal-native",
+  "version": "0.0.0",
+  "private": true,
+  "expo-module": {
+    "ios": {
+      "modules": [
+        "F4TerminalModule"
+      ]
+    },
+    "android": {
+      "modules": [
+        "expo.modules.f4terminal.F4TerminalModule"
+      ]
+    }
+  }
+}

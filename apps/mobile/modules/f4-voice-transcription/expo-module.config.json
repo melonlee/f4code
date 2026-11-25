@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["F4VoiceTranscriptionModule"],
+    "podspecPath": "ios/F4VoiceTranscription.podspec"
+  },
+  "android": {
+    "modules": ["expo.modules.f4voicetranscription.F4VoiceTranscriptionModule"]
+  }
+}

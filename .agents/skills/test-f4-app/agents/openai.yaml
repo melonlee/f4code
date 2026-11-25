@@ -1,0 +1,4 @@
+interface:
+  display_name: "F4 App Testing"
+  short_description: "Test web and desktop in F4's Browser panel"
+  default_prompt: "Use $test-f4-app to verify the affected web or desktop flow through F4's Browser panel."

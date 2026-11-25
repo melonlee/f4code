@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--f4-font-sans);
+  --font-mono: var(--f4-font-mono);
+  --color-background: var(--f4-background);
+  --color-foreground: var(--f4-foreground);
+  --color-popover: var(--f4-popover);
+  --color-popover-foreground: var(--f4-popover-foreground);
+  --color-primary: var(--f4-primary);
+  --color-primary-foreground: var(--f4-primary-foreground);
+  --color-muted: var(--f4-muted);
+  --color-muted-foreground: var(--f4-muted-foreground);
+  --color-accent: var(--f4-accent);
+  --color-accent-foreground: var(--f4-accent-foreground);
+  --color-border: var(--f4-border);
+  --color-input: var(--f4-input);
+  --color-ring: var(--f4-ring);
+  --radius-sm: calc(var(--f4-radius) - 4px);
+  --radius-md: calc(var(--f4-radius) - 2px);
+  --radius-lg: var(--f4-radius);
+  --radius-xl: calc(var(--f4-radius) + 4px);
+  --radius-2xl: calc(var(--f4-radius) + 8px);
+}
+
+:host {
+  --f4-font-sans:
+    "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  --f4-font-mono:
+    "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  --f4-radius: 0.625rem;
+  --f4-background: white;
+  --f4-foreground: oklch(0.269 0 0);
+  --f4-popover: white;
+  --f4-popover-foreground: oklch(0.269 0 0);
+  --f4-primary: oklch(0.488 0.217 264);
+  --f4-primary-foreground: white;
+  --f4-destructive: oklch(0.577 0.245 27.325);
+  --f4-muted: rgb(0 0 0 / 4%);
+  --f4-muted-foreground: oklch(0.556 0 0);
+  --f4-accent: rgb(0 0 0 / 4%);
+  --f4-accent-foreground: oklch(0.269 0 0);
+  --f4-border: rgb(0 0 0 / 8%);
+  --f4-input: rgb(0 0 0 / 10%);
+  --f4-ring: oklch(0.488 0.217 264);
+  color: var(--f4-foreground);
+  font-family: var(--f4-font-sans);
+}
+
+* {
+  box-sizing: border-box;
+  border-color: var(--f4-border);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--f4-ring) 72%, transparent);
+  outline-offset: -2px;
+}
+
+/* Utility display classes must not override the native hidden state. */
+[hidden] {
+  display: none !important;
+}

@@ -1,0 +1,9 @@
+src/
+pkg/
+*.AppImage
+*.pkg.tar.zst
+.SRCINFO
+f4code-bin-*.png
+f4code-bin-*-LICENSE
+f4code-nightly-bin-*.png
+f4code-nightly-bin-*-LICENSE

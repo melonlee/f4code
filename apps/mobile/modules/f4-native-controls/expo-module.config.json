@@ -1,0 +1,20 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["F4NativeControlsModule", "F4KeyboardCommandsModule"],
+    "appDelegateSubscribers": [
+      "F4WorkspaceOrientationSubscriber",
+      "F4MenuDismissTouchGateSubscriber",
+      "F4BackgroundGraceSubscriber"
+    ]
+  },
+  "android": {
+    "modules": [
+      "expo.modules.f4nativecontrols.F4NativeControlsModule",
+      "expo.modules.f4nativecontrols.F4WorkspaceNavigationModule",
+      "expo.modules.f4nativecontrols.F4KeyboardCommandsModule",
+      "expo.modules.f4nativecontrols.F4FoldPostureModule",
+      "expo.modules.f4nativecontrols.F4SecretInputModule"
+    ]
+  }
+}
